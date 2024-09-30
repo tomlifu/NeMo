@@ -1270,7 +1270,6 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                 forward_args.pop('loss_mask')
 
                 if 'cu_seqlens' in batch:  # packed sequence from GPTSFTPackedDataset
-                    #print("THD format")
                     # these args are passed eventually into TEDotProductAttention.forward()
                     cu_seqlens = batch['cu_seqlens'].squeeze()  # remove batch size dimension (mbs=1)
                     cu_seqlens_unpadded = batch['cu_seqlens_unpadded'].squeeze()
@@ -1296,30 +1295,15 @@ class MegatronGPTModel(MegatronBaseModel, TextGeneration):
                     cp_size = parallel_state.get_context_parallel_world_size()
                     if cp_size > 1:
                         cp_rank = parallel_state.get_context_parallel_rank()
-                        #print("cp_rank:{}, cu_seqlens:{}".format(cp_rank, cu_seqlens))
                         for key in required_keys:
                             val = batch[key]
                             if key not in {"cu_seqlens", "cu_seqlens_unpadded"}:
-                                #print("{} with size {}".format(key,val.size()))
-                                #print("before get index")
-                                #print(cu_seqlens)
-                                #print(cu_seqlens_unpadded)
-                                #print("****************")
                                 index = tex.thd_get_partitioned_indices(cu_seqlens, val.size(1), cp_size, cp_rank)
                                 val = val.index_select(1, index)
                                 batch[key] = val
-                                #print("after index select: {} with size {}".format(key,val.size()))
-                        
-                        ######################### NEED TO DOUBLE CHECK ###################
-                        #print(cu_seqlens)
-                        #print(cu_seqlens_unpadded)
-                        #print("****************")
                         cu_seqlens = cu_seqlens // cp_size
                         cu_seqlens_unpadded = cu_seqlens_unpadded // cp_size
-                        ##################################################################
-                        
-                        #print("After partition:")
-                        #print("cp_rank:{}, cu_seqlens:{} \n".format(cp_rank, cu_seqlens))
+
                         forward_args = {
                             'input_ids': batch['tokens'],
                             'position_ids': batch['position_ids'],
