@@ -22,7 +22,6 @@ from einops import rearrange
 from megatron.core.jit import jit_fuser
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
-    RowParallelLinear,
 )
 from megatron.core.transformer.attention import (
     CrossAttention,
@@ -111,7 +110,6 @@ class AdaLN(MegatronModule):
                 gather_output=True,
             ),
         )
-        print(modulation_bias)
         self.use_second_norm = use_second_norm
         if self.use_second_norm:
             if norm == TENorm:
@@ -125,7 +123,6 @@ class AdaLN(MegatronModule):
     @jit_fuser
     def forward(self, timestep_emb):
         output, bias = self.adaLN_modulation(timestep_emb)
-        print(bias)
         output = output + bias if bias else output
         return output.chunk(self.n_adaln_chunks, dim=-1)
 
@@ -167,36 +164,20 @@ class AdaLNContinuous(MegatronModule):
         conditioning_embedding_dim: int,
         modulation_bias: bool = True,
         norm_type: str = "layer_norm",
-        norm = nn.LayerNorm,
     ):
         super().__init__(config)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            ColumnParallelLinear(
-                conditioning_embedding_dim,
-                config.hidden_size * 2,
-                config=config,
-                init_method=nn.init.normal_,
-                bias=modulation_bias,
-                gather_output=True,
-            ),
+            nn.SiLU(), nn.Linear(conditioning_embedding_dim, config.hidden_size * 2, bias=modulation_bias)
         )
         if norm_type == "layer_norm":
-            if norm == TENorm:
-                self.norm = norm(config, config.hidden_size, config.layernorm_epsilon)
-            else:
-                self.norm = norm(config.hidden_size, elementwise_affine=False, eps=1e-6, bias=modulation_bias)
+            self.norm = nn.LayerNorm(config.hidden_size, elementwise_affine=False, eps=1e-6, bias=modulation_bias)
         elif norm_type == "rms_norm":
-            if norm == TENorm:
-                self.norm = norm(config, config.hidden_size, config.layernorm_epsilon)
-            else:
-                self.norm = norm(config.hidden_size, eps=1e-6)
+            self.norm = RMSNorm(config.hidden_size, eps=1e-6)
         else:
             raise ValueError("Unknown normalization type {}".format(norm_type))
 
     def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
-        output, bias = self.adaLN_modulation(conditioning_embedding)
-        emb = output + bias if bias else output
+        emb = self.adaLN_modulation(conditioning_embedding)
         scale, shift = torch.chunk(emb, 2, dim=1)
         x = self.norm(x) * (1 + scale) + shift
         return x

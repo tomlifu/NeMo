@@ -204,7 +204,7 @@ class Flux(VisionModule):
             ]
         )
 
-        self.norm_out = AdaLNContinuous(config=config, conditioning_embedding_dim=self.hidden_size, norm=TENorm if config.te_norm_in_adaln else nn.LayerNorm)
+        self.norm_out = AdaLNContinuous(config=config, conditioning_embedding_dim=self.hidden_size)
         self.proj_out = nn.Linear(self.hidden_size, self.patch_size * self.patch_size * self.out_channels, bias=True)
         if self.config.ckpt_path is not None:
             self.load_from_pretrained(
