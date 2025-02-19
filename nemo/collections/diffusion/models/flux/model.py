@@ -27,6 +27,7 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import openai_gelu, sharded_state_dict_default
+from megatron.core.transformer.custom_layers.transformer_engine import TENorm
 from safetensors.torch import load_file as load_safetensors
 from safetensors.torch import save_file as save_safetensors
 from torch import nn
@@ -84,6 +85,7 @@ class FluxConfig(TransformerConfig, io.IOMixin):
     hidden_dropout: float = 0
     attention_dropout: float = 0
     use_cpu_initialization: bool = True
+    te_norm_in_adaln: bool = False
 
     guidance_scale: float = 3.5
     data_step_fn: Callable = flux_data_step
@@ -202,7 +204,7 @@ class Flux(VisionModule):
             ]
         )
 
-        self.norm_out = AdaLNContinuous(config=config, conditioning_embedding_dim=self.hidden_size)
+        self.norm_out = AdaLNContinuous(config=config, conditioning_embedding_dim=self.hidden_size, norm=TENorm if config.te_norm_in_adaln else nn.LayerNorm)
         self.proj_out = nn.Linear(self.hidden_size, self.patch_size * self.patch_size * self.out_channels, bias=True)
         if self.config.ckpt_path is not None:
             self.load_from_pretrained(
