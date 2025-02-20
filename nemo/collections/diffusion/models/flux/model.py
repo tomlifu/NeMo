@@ -250,6 +250,11 @@ class Flux(VisionModule):
         Returns:
             torch.Tensor: The final output tensor from the model after processing all inputs.
         """
+        # input = (img, txt, y, timesteps, img_ids, txt_ids, guidance)
+        # torch.save(input, "input.pt")
+
+        img, txt, y, timesteps, img_ids, txt_ids, guidance = torch.load("input.pt")
+        print(img)
         hidden_states = self.img_embed(img)
         encoder_hidden_states = self.txt_embed(txt)
 
@@ -262,6 +267,7 @@ class Flux(VisionModule):
 
         ids = torch.cat((txt_ids, img_ids), dim=1)
         rotary_pos_emb = self.pos_embed(ids)
+        print("before double", hidden_states)
         for id_block, block in enumerate(self.double_blocks):
             hidden_states, encoder_hidden_states = block(
                 hidden_states=hidden_states,
@@ -276,7 +282,7 @@ class Flux(VisionModule):
                 hidden_states = hidden_states + controlnet_double_block_samples[id_block // interval_control]
 
         hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=0)
-
+        print("before single", hidden_states)
         for id_block, block in enumerate(self.single_blocks):
             hidden_states = block(
                 hidden_states=hidden_states,
@@ -296,10 +302,11 @@ class Flux(VisionModule):
                 )
 
         hidden_states = hidden_states[encoder_hidden_states.shape[0] :, ...]
-
+        print("before out", hidden_states)
         hidden_states = self.norm_out(hidden_states, vec_emb)
         output = self.proj_out(hidden_states)
-
+        print(output)
+        exit(0)
         return output
 
     def load_from_pretrained(

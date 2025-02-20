@@ -192,7 +192,7 @@ def unit_test() -> run.Partial:
         None  # run.Config(AutoEncoderConfig, ckpt='/ckpts/ae.safetensors', ch_mult=[1,2,4,4], attn_resolutions=[])
     )
     recipe.model.flux_params.device = 'cuda'
-    recipe.model.flux_params.flux_config = run.Config(FluxConfig, num_joint_layers=1, num_single_layers=1)
+    recipe.model.flux_params.flux_config = run.Config(FluxConfig, num_joint_layers=1, num_single_layers=1, ckpt_path='/ckpts/nemo_flux_transformer.safetensors')
     recipe.data.global_batch_size = 1
     recipe.trainer.strategy.ddp = run.Config(
         DistributedDataParallelConfig,
