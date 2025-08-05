@@ -14,6 +14,7 @@
 
 import atexit
 import functools
+import gc
 import inspect
 import logging as _logging
 import os
@@ -55,6 +56,7 @@ from megatron.core import Timers
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.training.training import cuda_graph_capture, cuda_graph_set_manual_hooks
 from torch import nn
 from torch.distributed.algorithms.ddp_comm_hooks.debugging_hooks import noop_hook
 from torch.distributed.checkpoint.utils import CheckpointException
@@ -130,6 +132,7 @@ class ParallelismConfig:
     nccl_communicator_config_path: str = None
     use_sharp: bool = False
     pipeline_model_parallel_layout: Optional[Union[str, List[List[str]]]] = None
+    use_gloo_process_groups: bool = True
 
 
 class MegatronStrategy(DDPStrategy, io.IOMixin):
@@ -169,6 +172,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         ckpt_type (TrainerCkptProtocol): Checkpoint type. Defaults to TrainerCheckpoint.
         ckpt_load_optimizer (bool): Load optimizer state from trainer.ckpt_path. Defaults to True.
         ckpt_save_optimizer (bool): Save optimizer states in checkpoint. Defaults to True.
+        ckpt_load_main_params (bool): Load main parameters from trainer.ckpt_path. Defaults to False.
         ddp (Union[DDPLiteral, DistributedDataParallelConfig]): DDP configuration. Defaults to "megatron".
         fsdp (Optional[FSDPLiteral]): Option of using torch FSDP2, select from ["megatron", "pytorch"].
             Defaults to None.
@@ -221,6 +225,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         use_sharp (bool): Whether to use SHARP. Defaults to False.
         pipeline_model_parallel_layout (Optional[Union[str, List[List[str]]]]): The layout of all layers among
             different PP and VP stages.
+        use_gloo_process_groups (bool): Whether to use Gloo process groups. Defaults to True.
         **kwargs: Additional keyword arguments.
 
     Note:
@@ -255,6 +260,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         find_unused_parameters: bool = False,
         ckpt_load_optimizer: bool = True,
         ckpt_save_optimizer: bool = True,
+        ckpt_load_main_params: bool = False,
         ddp: Union[DDPLiteral, DistributedDataParallelConfig] = "megatron",
         fsdp: Optional[FSDPLiteral] = None,
         lazy_init: bool = False,
@@ -281,6 +287,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         num_distributed_optimizer_instances: int = 1,
         nccl_communicator_config_path: Optional[str] = None,
         pipeline_model_parallel_layout: Optional[Union[str, List[List[str]]]] = None,
+        use_gloo_process_groups: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -316,6 +323,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         self.lazy_init = lazy_init
         self.ckpt_load_optimizer = ckpt_load_optimizer
         self.ckpt_save_optimizer = ckpt_save_optimizer
+        self.ckpt_load_main_params = ckpt_load_main_params
         self.ckpt_load_strictness = ckpt_load_strictness
         self.use_te_rng_tracker = use_te_rng_tracker
         self.use_sharp = use_sharp
@@ -338,6 +346,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         self.replace_progress_bar = replace_progress_bar
         self.progress_interval = progress_interval
         self.nccl_communicator_config_path = nccl_communicator_config_path
+        self.use_gloo_process_groups = use_gloo_process_groups
         self.restore_config = restore_config
         self.timers = Timers(megatron_log_level, "minmax")  ## could also set this for optimizer if we want
         self.pipeline_model_parallel_layout = pipeline_model_parallel_layout
@@ -386,6 +395,9 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             self.no_ddp_communication_hook = False
         else:
             raise ValueError(f"Invalid DDP type: {ddp}")
+
+        if self.ckpt_load_optimizer and self.ckpt_load_main_params:
+            raise ValueError("ckpt_load_optimizer and ckpt_load_main_params cannot be both set to True.")
 
         if isinstance(self.ddp_config, DistributedDataParallelConfig):
             self.ddp_config.num_distributed_optimizer_instances = self.num_distributed_optimizer_instances
@@ -562,6 +574,10 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         """Setups dist env"""
         setup_parallel_ranks(self)
 
+        # Capture the external cudagraph on a side stream
+        if hasattr(self.model, 'config') and getattr(self.model.config, 'external_cuda_graph', False):
+            torch.cuda.set_stream(torch.cuda.Stream())
+
         # Implementation from superclass copied below in order to pass the store to the process group init
         reset_seed()
         self.set_world_ranks()
@@ -710,6 +726,35 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
         assert self.lightning_module is not None
         assert isinstance(self.model, MegatronParallel)
 
+        # Capture the external cuda graph for the first step
+        if (
+            self.trainer.global_step == 0
+            and hasattr(self.model, 'config')
+            and getattr(self.model.config, 'external_cuda_graph', False)
+        ):
+            # disable the prehook
+            if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
+                self.model.disable_forward_pre_hook()
+                param_sync_func = self.model.config.param_sync_func
+                self.model.config.param_sync_func = None
+            import argparse
+
+            partial_cg_args = argparse.Namespace()
+            partial_cg_args.position_embedding_type = self.model.config.position_embedding_type
+            partial_cg_args.seq_length = self.trainer.datamodule.seq_length
+            partial_cg_args.micro_batch_size = self.trainer.datamodule.micro_batch_size
+            cuda_graph_capture(self.model, self.model.config, partial_cg_args)
+
+            # Set grad to zero.
+            for model_chunk in self.model:
+                model_chunk.zero_grad_buffer()
+            for opt in self.optimizers:
+                opt.zero_grad()
+
+            # Collect garbage and empty unused memory.
+            gc.collect()
+            torch.cuda.empty_cache()
+
         with self.precision_plugin.train_step_context():  # TODO: Do we need this?
             # Set grad to zero.
             for model_chunk in self.model:
@@ -729,6 +774,18 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
                     raise ValueError(f"Expected 'loss' in output dict, got {out.keys()}")
 
                 reduced_train_loss = out["loss"]
+
+            if (
+                self.trainer.global_step == 0
+                and hasattr(self.model, 'config')
+                and getattr(self.model.config, 'external_cuda_graph', False)
+            ):
+                if self.ddp_config.use_distributed_optimizer and self.ddp_config.overlap_param_gather:
+                    # enable the prehook
+                    self.model.enable_forward_pre_hook()
+                    self.model.config.param_sync_func = param_sync_func
+                    param_sync_func = None
+                    cuda_graph_set_manual_hooks(self.model)
 
             self.lightning_module.log(
                 "global_step",
@@ -1048,7 +1105,13 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
 
         if not 'optimizer' in checkpoint:
             for opt in self.optimizers:
-                opt.reload_model_params()
+                if self.ckpt_load_main_params:
+                    if "state_dict" in checkpoint:
+                        opt.reload_model_params(checkpoint["state_dict"])
+                    else:
+                        opt.reload_model_params(checkpoint)
+                else:
+                    opt.reload_model_params()
 
     @property
     @override
@@ -1136,6 +1199,7 @@ class MegatronStrategy(DDPStrategy, io.IOMixin):
             nccl_communicator_config_path=self.nccl_communicator_config_path,
             use_sharp=self.use_sharp,
             pipeline_model_parallel_layout=self.pipeline_model_parallel_layout,
+            use_gloo_process_groups=self.use_gloo_process_groups,
         )
 
     @contextmanager
