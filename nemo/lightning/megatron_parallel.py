@@ -20,6 +20,7 @@ import collections.abc
 import functools
 import inspect
 import itertools
+import operator
 import queue
 import types
 from collections import defaultdict
@@ -53,9 +54,12 @@ from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel as McoreDDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
+from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
 from megatron.core.transformer.transformer_config import TransformerConfig
 from torch import Tensor, nn
 from typing_extensions import override
+
+from nemo.utils.model_utils import check_lib_version
 
 try:
     from megatron.core.distributed.custom_fsdp import FullyShardedDataParallel
@@ -63,6 +67,21 @@ try:
     HAVE_CUSTOM_FSDP = True
 except ImportError:
     HAVE_CUSTOM_FSDP = False
+
+try:
+    from megatron.core.distributed import FullyShardedDataParallel
+
+    HAVE_MEGATRON_FSDP = True
+except ImportError:
+    HAVE_MEGATRON_FSDP = False
+
+try:
+    from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+
+    HAVE_FULL_CUDA_GRAPH = True
+except ImportError:
+    _, mcore_import_msg = check_lib_version("megatron.core", "0.14.0", operator.ge)
+    HAVE_FULL_CUDA_GRAPH = False
 
 DataT = TypeVar("DataT", Tensor, Dict[str, Tensor], Sequence[Tensor])
 ModelT = TypeVar("ModelT", bound=nn.Module)
@@ -542,7 +561,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         from megatron.core.tensor_parallel.layers import set_defaults_if_not_set_tensor_model_parallel_attributes
 
         for model_module in self:
-            if not self._cpu and (not HAVE_CUSTOM_FSDP or self.fsdp != "megatron"):
+            if not self._cpu and ((not HAVE_MEGATRON_FSDP and not HAVE_CUSTOM_FSDP) or self.fsdp != "megatron"):
                 # If Megatron custom FSDP is enabled, we don't need to move the model to GPU here to avoid GPU OOM.
                 model_module.cuda(torch.cuda.current_device())
 
@@ -583,7 +602,9 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         # Skip init_ddp for inference i.e testing as it can lead to OOM.
         try:
             if not self.trainer.state.fn == TrainerFn.TESTING:
-                self.init_ddp()
+                # DDP initialization is required to be on side-stream to for full iteration CUDA graph.
+                with torch.cuda.stream(torch.cuda.Stream()):
+                    self.init_ddp()
         except RuntimeError as e:
             # Don't fail if trainer is not attached, re-raise any other RuntimeError
             if "is not attached to a `Trainer`" not in str(e):
@@ -621,11 +642,15 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
                 # Avoid rewrapping the module if it's already wrapped with FSDP
                 unwrapped_module = unwrap_model(module, Float16Module)
                 if (
-                    HAVE_CUSTOM_FSDP
+                    (HAVE_MEGATRON_FSDP or HAVE_CUSTOM_FSDP)
                     and self.fsdp == "megatron"
                     and not isinstance(unwrapped_module, FullyShardedDataParallel)
                 ):
                     from nemo.utils import logging
+
+                    if not getattr(module.config, "use_megatron_fsdp", False):
+                        setattr(module.config, "use_megatron_fsdp", True)
+                        logging.warning("Setting module.config.use_megatron_fsdp to True for MCore FSDP.")
 
                     if not getattr(module.config, "use_custom_fsdp", False):
                         setattr(module.config, "use_custom_fsdp", True)
@@ -635,8 +660,16 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
                         setattr(module.config, "gradient_accumulation_fusion", False)
                         logging.warning("Setting module.config.gradient_accumulation_fusion to False for MCore FSDP.")
 
-                    assert module.config.use_custom_fsdp, "Custom FSDP is not enabled in module.config."
-                    assert self.ddp_config.use_custom_fsdp, "Custom FSDP is not enabled in ddp_config."
+                    if HAVE_MEGATRON_FSDP:
+                        assert module.config.use_megatron_fsdp, "MCore FSDP is not enabled in module.config."
+                        assert self.ddp_config.use_megatron_fsdp, "MCore FSDP is not enabled in ddp_config."
+                    elif HAVE_CUSTOM_FSDP:
+                        assert module.config.use_custom_fsdp, "MCore FSDP is not enabled in module.config."
+                        assert self.ddp_config.use_custom_fsdp, "MCore FSDP is not enabled in ddp_config."
+                        logging.warning(
+                            "Deprecation Notice: `use_custom_fsdp` will be deprecated in M-Core 0.14. "
+                            "Please use `use_megatron_fsdp` instead."
+                        )
 
                     dist_module = FullyShardedDataParallel(
                         module.config,
@@ -644,6 +677,10 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
                         module,
                         disable_bucketing=disable_bucketing,
                     )
+                    if HAVE_MEGATRON_FSDP:
+                        dist_module.buffers = [dist_module.param_and_grad_buffer]
+                        dist_module.config = module.config
+                        dist_module.sharded_state_dict = lambda *args, **kwargs: dist_module.state_dict()
                 elif not isinstance(unwrapped_module, DDP):
                     dist_module = DDP(
                         module.config,
@@ -1383,6 +1420,19 @@ class MegatronStep(Generic[ModelT, DataT]):
         """
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
+        config = self.model[0].config if isinstance(self.model, list) else self.model.config
+        if (
+            hasattr(config, "enable_cuda_graph")
+            and config.enable_cuda_graph
+            and config.cuda_graph_scope == "full_iteration"
+        ):
+            if HAVE_FULL_CUDA_GRAPH:
+                return FullCudaGraphWrapper(get_forward_backward_func())
+            else:
+                raise ImportError(
+                    f"FullCudaGraphWrapper is not available in this version of megatron.core ({mcore_import_msg}). "
+                    "Please upgrade megatron.core to >= 0.14.0 to use full iteration CUDA graphs."
+                )
         return get_forward_backward_func()
 
     @property
@@ -1840,7 +1890,8 @@ def moe_loss_tracker_ctx():
 @torch.no_grad()
 def aggregate_moe_loss_stats(loss_scale=1.0):
     with moe_loss_tracker_ctx():
-        tracker = parallel_state.get_moe_layer_wise_logging_tracker()
+
+        tracker = get_moe_layer_wise_logging_tracker()
         aux_losses = {k: v['values'].float() * loss_scale for k, v in tracker.items()}
         total_loss_dict = {}
         for name, loss_list in aux_losses.items():

@@ -124,6 +124,7 @@ def _load_base_model_and_lora(lora_checkpoint_path: Path) -> Tuple[pl.LightningM
     model.model_transform, model.__io__.model_transform = None, None
     model.config.bf16 = True
     model.config.params_dtype = torch.bfloat16
+    model.config.perform_initialization = False
     lora: Union[io.TrainerContext, LoRA] = io.load_context(
         ckpt_to_context_subdir(lora_checkpoint_path), "model.model_transform"
     )
@@ -187,7 +188,7 @@ def _save_merged_weight(output_path: str, merged_weights: dict, model: pl.Lightn
     )
     if hasattr(model.tokenizer, "save_pretrained"):
         model.tokenizer.save_pretrained("/tmp/nemo_tokenizer")
-        model.tokenizer = AutoTokenizer("/tmp/nemo_tokenizer")
+        model.tokenizer = AutoTokenizer("/tmp/nemo_tokenizer", trust_remote_code=True)
     if hasattr(trainer.model, "__io__") and hasattr(trainer.model.tokenizer, '__io__'):
         trainer.model.__io__.tokenizer = trainer.model.tokenizer.__io__
     TrainerContext.from_trainer(trainer).io_dump(ckpt_to_context_subdir(output_path), yaml_attrs=["model"])
