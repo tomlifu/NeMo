@@ -225,6 +225,7 @@ if __name__ == "__main__":
 
     executor = run.LocalExecutor(ntasks_per_node=8, launcher="torchrun", env_vars=env_vars)
     from nemo.collections.llm.recipes.precision.mixed_precision import bf16_with_fp8_mixed
+
     recipe.trainer.plugins = bf16_with_fp8_mixed()
     recipe.trainer.plugins.grad_reduce_in_fp32 = False
     recipe.trainer.strategy.tensor_model_parallel_size = 2
